@@ -108,6 +108,7 @@ def nettoyer(df, resultats=None):
             bad = int((~np.isfinite(x.to_numpy(float))).sum())
             if bad:
                 rapport.append(f"{nom} · {c} : {bad:,} valeurs manquantes/infinies".replace(",", " "))
+            d[c] = x   # conversion RÉELLE : sinon une colonne lue comme texte reste du texte malgré la vérification
     erreur_res = None
     if resultats is not None:
         cols_ok = [c for c in CRITIQUES if c in resultats.columns]
@@ -125,6 +126,9 @@ def nettoyer(df, resultats=None):
 
 def prep(d):
     d = d.copy()
+    for c in ("IssueAge", "PolYear", "ExposCnt", "ExposAmt", "ExposAmt2", "ExpecCnt", "ExpecAmt"):
+        if c in d.columns:
+            d[c] = pd.to_numeric(d[c], errors="coerce")   # sécurité : nettoyer() a dû le faire, mais on ne suppose rien
     d["Year"] = pd.to_numeric(d["Year"]).astype(int)
     d["YearStart"] = d["Year"] // 100 + 2000
     d["PolGrp"] = d["PolTypeGrp"].map(GRP_MAP).fillna(9).astype(int)
