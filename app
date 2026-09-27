@@ -405,7 +405,15 @@ def criteres_credibilite(d, strate, tab, decoupage=None, n_plein=N_PLEIN):
     return blocs
 
 
-def residus_par_strate(d, y_cnt, p_cnt, y_amt, p_amt, strate, decoupage=None):
+def residus_par_strate(d, y_cnt, p_cnt, y_amt, p_amt, strate, decoupage=None, masque=None):
+    """Résidus par strate. `masque` : booléens (un par ligne de d) des lignes réellement prédites hors-pli.
+    Indispensable si l'entraînement a été interrompu avant le dernier pli : les prédictions ne couvrent
+    alors qu'une partie des lignes de d."""
+    if masque is not None:
+        d = d.loc[np.asarray(masque, bool)]
+    if len(d) != len(np.asarray(y_amt)):
+        raise ValueError(f"residus_par_strate : {len(d)} lignes de d contre {len(np.asarray(y_amt))} prédictions — "
+                         "fournis le masque des lignes couvertes (resume['cov']).")
     d2, correspondance = appliquer_decoupage(d, decoupage)
     cols = [correspondance.get(c, c) for c in strate] or ["_tout"]
     d2 = d2.assign(_tout=0) if not strate else d2
@@ -633,28 +641,6 @@ def predire(bundle, resultats, appliquer_la_tendance=True):
             pred = appliquer_tendance(pred, n)
         sub[cible_out] = np.clip(pred, 0, None)
     return sub
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
@@ -1126,6 +1112,10 @@ elif etape == 5:
         st.caption("💡 En clair : le RMSE et la déviance mesurent l'écart entre prédictions et réalité (plus petit "
                   "= mieux). Le Gini mesure la capacité à bien classer les risques du plus faible au plus élevé. "
                   "Toutes ces métriques viennent de prédictions hors-pli (jamais vues à l'entraînement).")
+        n_total = len(st.session_state.df)
+        if r["n"] < n_total:
+            st.warning(f"Entraînement interrompu avant le dernier pli : les métriques et les résidus portent sur "
+                      f"{r['n']:,} lignes sur {n_total:,} ({r['n'] / n_total:.0%}).".replace(",", " "))
 
         st.markdown("**Nombre de décès (DthCnt)**")
         m1, m2, m3 = st.columns(3)
@@ -1144,7 +1134,8 @@ elif etape == 5:
         st.markdown("**Résidus par strate** (écart entre réel et prédit, pour les deux cibles)")
         if st.session_state.strate and not st.session_state.sans_strate:
             d = b.preparer(st.session_state.df, "melange")
-            res_strate = b.residus_par_strate(d, r["y_cnt"], r["p_cnt"], r["y_amt"], r["p_amt"], st.session_state.strate, st.session_state.decoupage)
+            res_strate = b.residus_par_strate(d, r["y_cnt"], r["p_cnt"], r["y_amt"], r["p_amt"], st.session_state.strate,
+                                              st.session_state.decoupage, masque=r["cov"])
             st.dataframe(res_strate.style.format({"Reel_Cnt": "{:,.2f}", "Predit_Cnt": "{:,.2f}", "Ecart_Cnt": "{:,.2f}",
                                                   "Reel_Amt": "{:,.2f}", "Predit_Amt": "{:,.2f}", "Ecart_Amt": "{:,.2f}", "Ecart_Amt_pct": "{:.2%}"}),
                         use_container_width=True, height=300)
@@ -1197,6 +1188,25 @@ elif etape == 5:
             for k in list(st.session_state.keys()):
                 del st.session_state[k]
             st.rerun()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
