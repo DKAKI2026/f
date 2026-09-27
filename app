@@ -1,15 +1,16 @@
 # -*- coding: utf-8 -*-
 """
 BACKEND — aucune dépendance à Streamlit. Prédit uniquement le montant (DthAmt), avec LightGBM seul.
+AUCUNE validation croisée : un seul entraînement, sur toutes les lignes de df (choix assumé — voir
+le rappel affiché avec les métriques : elles sont mesurées sur les données que le modèle a apprises).
 
 Sections : 1. Constantes  2. Préparation des données (+ cohorte)  3. Strates : tranches personnalisables,
-crédibilité, suggestion de fusion  4. Sélection dynamique (colonnes secondaires seulement)
-5. Entraînement LightGBM, pli par pli  6. Tendance temporelle (appliquée APRÈS la prédiction)
-7. Métriques (RMSE, déviance de Poisson, Gini, double lift)  8. Sauvegarde / chargement / prédiction
+crédibilité, les 5 critères  4. Sélection des colonnes secondaires par importance LightGBM
+5. Entraînement (un seul ajustement, sur toutes les données)  6. Tendance temporelle (taux fixe)
+7. Métriques (RMSE, déviance de Poisson, Gini, résidus par strate)  8. Sauvegarde / chargement / prédiction
 """
 import math
 import pickle
-import time
 import warnings
 from statistics import NormalDist
 
@@ -42,31 +43,33 @@ LIBELLES = {
     "Base": {0: "Avenant", 1: "Contrat de base"},
 }
 
-# Le socle : toujours inclus dans le modèle, jamais soumis à la sélection dynamique.
+# Le socle : toujours inclus dans le modèle, jamais soumis à la sélection.
 SOCLE = ["Sex", "Smoke", "PolYear", "AttdAge", "Size"]
 
-# Colonnes secondaires : seules celles-ci passent par la sélection dynamique (section 4).
+# Colonnes secondaires proposées à la sélection (manuelle ou par importance).
 CANDIDATS_SECONDAIRES = {
-    "PolGrp":      "Type de police regroupé",
-    "Base":        "Contrat de base ou avenant",
-    "Par":         "Avec ou sans participation",
-    "IssueYear":   "Année d'émission (cohorte de souscription)",
-    "log_qx_amt":  "Log du taux de mortalité implicite de la table",
-    "log_avg_size":"Log du capital moyen par police",
-    "cv2":         "Dispersion des capitaux dans la cellule",
-    "log_expos":   "Log du nombre de polices exposées",
-    "coh_ae_amt":  "Réel/attendu des autres lignes de la même cohorte",
-    "coh_log_E":   "Poids de l'information derrière coh_ae_amt",
+    "PolGrp":       "Type de police regroupé (fusionne les catégories qui n'existent que sur certaines années)",
+    "Base":         "Contrat de base ou avenant",
+    "Par":          "Avec ou sans participation",
+    "IssueYear":    "Année d'émission (identifie la cohorte de souscription)",
+    "log_qx_amt":   "Log du taux de mortalité implicite de la table (ExpecAmt / ExposAmt)",
+    "log_avg_size": "Log du capital moyen par police (ExposAmt / ExposCnt)",
+    "cv2":          "Dispersion des capitaux dans la cellule (1 = tous identiques)",
+    "log_expos":    "Log du nombre de polices exposées",
+    "coh_ae_amt":   "Réel/attendu des AUTRES lignes de la même cohorte (mêmes assurés, autres années)",
+    "coh_log_E":    "Poids (log) de l'information disponible derrière coh_ae_amt",
 }
 
 # Colonnes numériques qu'on peut découper soi-même en tranches, à l'étape « Strates ».
 COLONNES_DECOUPABLES = ["AttdAge", "PolYear", "YearStart"]
 
-# Fourchette de référence pour le taux de tendance (source : recherche ICA, voir conversation).
-TAUX_TENDANCE_MIN = 0.010
-TAUX_TENDANCE_MAX = 0.019
-TAUX_TENDANCE_SOURCE = ("Fourchette raisonnable selon la recherche de l'ICA (CIA-MI-2024) pour un taux "
-                        "d'amélioration de la mortalité à long terme : 1,0 % à 1,9 % par année.")
+# Taux de tendance : FIXE, pas laissé au choix de l'utilisateur.
+# 1,3 %/an = taux ultime publié par l'ICA (étude CIA-MI-2024) pour les âges 40-90 ans — voir recherche
+# menée dans cette conversation. Appliqué APRÈS la prédiction du modèle, jamais comme variable d'entrée.
+TAUX_TENDANCE = 0.013
+TAUX_TENDANCE_SOURCE = ("Taux fixé à 1,3 % par année — le taux ultime publié par l'ICA (étude CIA-MI-2024) "
+                        "pour les âges 40 à 90 ans. Appliqué uniquement sur les lignes portant sur une "
+                        "année postérieure à la dernière année de df, jamais donné en entrée au modèle.")
 
 
 # ============================================================================================
@@ -116,7 +119,6 @@ def nettoyer(df, resultats=None):
 
 
 def prep(d):
-    """Ajoute toutes les colonnes calculées."""
     d = d.copy()
     d["Year"] = pd.to_numeric(d["Year"]).astype(int)
     d["YearStart"] = d["Year"] // 100 + 2000
@@ -139,24 +141,6 @@ def detecter_mode(df, resultats):
     return "melange" if resultats["Year"].isin(df["Year"]).mean() > 0.9 else "futur"
 
 
-def plis(d, mode, n_splits, seed=42):
-    if mode == "melange":
-        return list(KFold(n_splits, shuffle=True, random_state=seed).split(d))
-    ys = np.sort(d["YearStart"].unique())[-min(3, n_splits):]
-    yr = d["YearStart"].to_numpy()
-    return [(np.where(yr < v)[0], np.where(yr == v)[0]) for v in ys]
-
-
-def pdev(y, p):
-    y, p = np.asarray(y, float), np.clip(np.asarray(p, float), 1e-12, None)
-    t = np.where(y > 0, y * np.log(np.where(y > 0, y, 1) / p), 0.0)
-    return float(2 * np.sum(t - (y - p)) / len(y))
-
-
-def rmse(y, p):
-    return float(np.sqrt(np.mean((np.asarray(y, float) - np.asarray(p, float)) ** 2)))
-
-
 def cohort_table(src, k=1.0):
     g = src.groupby(KEY, sort=False).agg(DA=("DthAmt", "sum"), EA=("ExpecAmt", "sum")).reset_index()
     k_amt = k * src["ExpecAmt"].sum() / max(len(src), 1)
@@ -169,15 +153,13 @@ def cohort_from_table(g, k_amt, dst, k=1.0):
                          "coh_log_E": np.log1p(m["EA"]).values}, index=dst.index)
 
 
-def cohort_apply(src, dst, k=1.0):
-    g, k_amt = cohort_table(src, k)
-    return cohort_from_table(g, k_amt, dst, k)
-
-
 def cohort_oof(src, n_splits=5, seed=0):
+    """Utilisée UNIQUEMENT pour donner une variable de cohorte hors-pli au modèle (elle-même, pas une
+    validation du modèle) : sans ça, coh_ae_amt d'une ligne contiendrait sa propre réponse."""
     out = pd.DataFrame(index=src.index, columns=["coh_ae_amt", "coh_log_E"], dtype=float)
     for tr, va in KFold(n_splits, shuffle=True, random_state=seed).split(src):
-        out.iloc[va] = cohort_apply(src.iloc[tr], src.iloc[va]).values
+        g, k_amt = cohort_table(src.iloc[tr])
+        out.iloc[va] = cohort_from_table(g, k_amt, src.iloc[va]).values
     return out
 
 
@@ -191,8 +173,19 @@ def preparer(df, mode):
     return d
 
 
+def pdev(y, p):
+    """Déviance de Poisson MOYENNE (divisée par le nombre de lignes, jamais une somme brute)."""
+    y, p = np.asarray(y, float), np.clip(np.asarray(p, float), 1e-12, None)
+    t = np.where(y > 0, y * np.log(np.where(y > 0, y, 1) / p), 0.0)
+    return float(2 * np.sum(t - (y - p)) / len(y))
+
+
+def rmse(y, p):
+    return float(np.sqrt(np.mean((np.asarray(y, float) - np.asarray(p, float)) ** 2)))
+
+
 # ============================================================================================
-# SECTION 3 — Strates : tranches personnalisables, crédibilité, suggestion de fusion
+# SECTION 3 — Strates : tranches personnalisables, crédibilité, les 5 critères
 # ============================================================================================
 def niveau_pct(p):
     if p is None or not np.isfinite(p):
@@ -208,21 +201,31 @@ def colonnes_decoupables_disponibles(d):
     return [c for c in COLONNES_DECOUPABLES if c in d.columns]
 
 
+def suggestion_bornes(d, col, n_tranches=5):
+    q = np.linspace(0, 1, n_tranches + 1)
+    bornes = sorted(set(int(x) for x in d[col].quantile(q).to_numpy()))
+    if bornes[0] > d[col].min():
+        bornes[0] = int(d[col].min())
+    bornes[-1] = 10 ** 6
+    return bornes
+
+
 def appliquer_decoupage(d, decoupage):
     """
     decoupage : dict optionnel {colonne: config}.
-      - Pour une colonne numérique (AttdAge, PolYear, YearStart) : config = liste de bornes croissantes,
-        ex. [0, 20, 40, 60, 80, 200] -> tranches "0-19", "20-39", ...
-      - Pour Size (déjà en tranches 1-8) : config = dict {code_original: libellé_du_groupe},
-        pour regrouper des tranches existantes, ex. {1: "0-50k", 2: "0-50k", 3: "50k+", ...}.
-    Renvoie (d avec les colonnes *_grp ajoutées, mapping colonne_originale -> colonne_a_utiliser_dans_strate).
+      - Colonne numérique (AttdAge, PolYear, YearStart) : config = liste de bornes croissantes.
+      - Size : config = dict {code_original: libellé_du_groupe}. Un libellé vide ou blanc revient
+        automatiquement au libellé d'origine de ce code (jamais de groupe "vide").
+    Renvoie (d avec les colonnes *_grp ajoutées, mapping colonne_originale -> colonne_a_utiliser).
     """
     d = d.copy()
     correspondance = {}
     for col, config in (decoupage or {}).items():
         if col == "Size" or isinstance(config, dict):
+            defaut = LIBELLES.get(col, {})
+            propre = {k: (str(v).strip() if str(v).strip() else str(defaut.get(k, k))) for k, v in config.items()}
             grp_col = col + "_grp"
-            d[grp_col] = d[col].map(config).fillna(d[col].astype(str))
+            d[grp_col] = d[col].map(propre).fillna(d[col].map(defaut)).fillna(d[col].astype(str))
             correspondance[col] = grp_col
         else:
             bornes = sorted(config)
@@ -234,23 +237,11 @@ def appliquer_decoupage(d, decoupage):
     return d, correspondance
 
 
-def suggestion_bornes(d, col, n_tranches=5):
-    """Bornes de départ suggérées (quantiles), modifiables ensuite par l'utilisateur."""
-    q = np.linspace(0, 1, n_tranches + 1)
-    bornes = sorted(set(int(x) for x in d[col].quantile(q).to_numpy()))
-    if bornes[0] > d[col].min():
-        bornes[0] = int(d[col].min())
-    bornes[-1] = 10 ** 6
-    return bornes
-
-
 def credibilite(deces, n_plein=N_PLEIN):
     return np.minimum(1.0, np.sqrt(np.asarray(deces, float) / n_plein))
 
 
 def table_strates(d, strate, decoupage=None, n_plein=N_PLEIN):
-    """d doit déjà être préparé (prep()/preparer()). `strate` : colonnes ORIGINALES choisies par l'utilisateur ;
-    `decoupage` transforme certaines d'entre elles en tranches personnalisées avant le regroupement."""
     d2, correspondance = appliquer_decoupage(d, decoupage)
     cols_reel = [correspondance.get(c, c) for c in strate]
     cols = cols_reel or ["_tout"]
@@ -265,7 +256,7 @@ def table_strates(d, strate, decoupage=None, n_plein=N_PLEIN):
     g["Poids"] = g["Attendu"] / g["Attendu"].sum()
     g["Fiabilite"] = g["Z"].map(lambda z: {"bas": "Faible", "moyen": "Moyenne", "haut": "Bonne"}.get(niveau_pct(z), "Inconnue"))
     for c_orig, c_reel in zip(strate, cols_reel):
-        if c_reel == c_orig and c_orig in LIBELLES:       # pas de découpage perso : on garde le libellé standard
+        if c_reel == c_orig and c_orig in LIBELLES:
             g[c_orig + "_libelle"] = g[c_orig].map(LIBELLES[c_orig]).fillna(g[c_orig].astype(str))
     g.attrs["cols_reel"] = cols_reel
     g.attrs["strate_orig"] = list(strate)
@@ -282,102 +273,146 @@ def appliquer_facteur(tab, strate, d, decoupage=None):
     return d["ExpecAmt"].to_numpy(float) * f, f, inconnu
 
 
-def suggestion_fusion(tab, seuil_z=1.5):
-    """
-    Compare les strates voisines le long de la DERNIÈRE colonne de la strate (supposée ordonnée :
-    une tranche numérique découpée, ou Size). Pour chaque groupe de strates qui ne diffèrent que sur
-    cette dernière colonne, propose une fusion entre voisines quand l'écart de ratio est petit par
-    rapport à l'incertitude statistique attendue (approximation Poisson : erreur type ~ ratio/racine(décès)).
-    Renvoie un DataFrame, vide si la strate n'a pas au moins 2 niveaux sur sa dernière colonne.
-    """
-    cols_reel = tab.attrs.get("cols_reel", [])
-    if len(cols_reel) < 1:
-        return pd.DataFrame()
-    col_ord, cols_fixes = cols_reel[-1], cols_reel[:-1]
-    lignes = []
-    groupes = tab.groupby(cols_fixes) if cols_fixes else [(None, tab)]
-    for _, g in groupes:
-        g = g.sort_values(col_ord).reset_index(drop=True)
-        for i in range(len(g) - 1):
-            a, b = g.iloc[i], g.iloc[i + 1]
-            se_a = a["Ratio"] / max(np.sqrt(a["Deces"]), 1e-6)
-            se_b = b["Ratio"] / max(np.sqrt(b["Deces"]), 1e-6)
-            ecart = abs(a["Ratio"] - b["Ratio"])
-            se_comb = np.sqrt(se_a ** 2 + se_b ** 2)
-            fusion_reco = ecart < seuil_z * se_comb
-            deces_f, att_f, reel_f = a["Deces"] + b["Deces"], a["Attendu"] + b["Attendu"], a["Reel"] + b["Reel"]
-            z_f = float(credibilite(deces_f))
-            ratio_f = reel_f / att_f if att_f > 0 else 1.0
-            lignes.append({**{c: a[c] for c in cols_fixes}, f"{col_ord} (A)": a[col_ord], f"{col_ord} (B)": b[col_ord],
-                          "Ratio A": a["Ratio"], "Ratio B": b["Ratio"], "Écart": ecart, "Écart attendu (bruit)": se_comb,
-                          "Z fusionné": z_f, "Facteur fusionné": z_f * ratio_f, "Recommandation": "Fusionner" if fusion_reco else "Garder séparées"})
-    return pd.DataFrame(lignes)
-
-
-# ============================================================================================
-# SECTION 4 — Sélection dynamique (colonnes SECONDAIRES seulement ; le socle est toujours inclus)
-# ============================================================================================
-def _glm_ratio_oof(d, cols, plis_):
-    from sklearn.linear_model import PoissonRegressor
-    from sklearn.compose import ColumnTransformer
-    from sklearn.preprocessing import OneHotEncoder, SplineTransformer
-    from sklearn.pipeline import Pipeline
-    num = [c for c in cols if c in ("AttdAge", "PolYear", "IssueAge", "YearStart", "log_qx_amt",
-                                    "log_avg_size", "log_expos", "coh_log_E", "coh_ae_amt", "cv2")]
-    cat = [c for c in cols if c not in num]
-    o = np.ones(len(d))
-    if not cols:
-        return o
+def criteres_credibilite(d, strate, tab, decoupage=None, n_plein=N_PLEIN):
+    """Les 5 critères, chacun {titre, lignes: [(symbole, texte, niveau_ou_None)]}. Langage simple.
+    Rien ne lève d'exception : une vérification impossible renvoie un ⚠ au lieu de planter."""
+    d2, correspondance = appliquer_decoupage(d, decoupage)
+    cols = [correspondance.get(c, c) for c in strate] or ["_tout"]
+    d2 = d2.assign(_tout=0) if not strate else d2
     blocs = []
-    if cat:
-        blocs.append(("cat", OneHotEncoder(handle_unknown="ignore"), cat))
-    if num:
-        blocs.append(("num", SplineTransformer(n_knots=5, degree=3, extrapolation="constant"), num))
-    E, y = d["ExpecAmt"].to_numpy(float), d["DthAmt"].to_numpy(float)
-    for tr, va in plis_:
-        pipe = Pipeline([("prep", ColumnTransformer(blocs, sparse_threshold=1.0)), ("glm", PoissonRegressor(alpha=1e-4, max_iter=400))])
-        pipe.fit(d.iloc[tr][cols], y[tr] / np.clip(E[tr], 1e-9, None), glm__sample_weight=E[tr])
-        o[va] = np.clip(pipe.predict(d.iloc[va][cols]), 1e-3, 1e2)
-    return o
+
+    def bloc(titre, fn):
+        lignes = []
+        try:
+            fn(lignes)
+        except Exception as e:
+            lignes.append(("⚠", f"Vérification impossible ({type(e).__name__}: {e})", None))
+        blocs.append({"titre": titre, "lignes": lignes})
+
+    def _fmt(x, nd=0):
+        return f"{x:,.{nd}f}".replace(",", " ")
+
+    def racine(lignes):
+        z = np.minimum(1.0, np.sqrt(tab["Deces"] / n_plein))
+        ecart = float(np.abs(z - tab["Z"]).max())
+        lignes.append(("✓" if ecart < 1e-9 else "⚠",
+                       f"Règle utilisée : en dessous de {_fmt(n_plein)} décès, on ne fait pas encore pleinement "
+                       "confiance à une strate — plus elle a de décès, plus son facteur compte, jusqu'à ce seuil.", None))
+        pleines = tab["Z"] >= 1.0
+        part = float(tab.loc[pleines, "Poids"].sum())
+        lignes.append(("ℹ", f"{int(pleines.sum())} strate(s) sur {len(tab)} ont assez de décès pour être pleinement "
+                       f"fiables (100 % de crédibilité), et elles représentent {part:.0%} du montant total attendu.", niveau_pct(part)))
+
+    def intervalle(lignes):
+        z_def = float(math.erf(0.03 * math.sqrt(n_plein) / math.sqrt(2)))
+        lignes.append(("✓" if abs(z_def - 0.90) < 0.02 else "⚠",
+                       f"Le seuil de {_fmt(n_plein)} décès correspond à une confiance d'environ 90 % que l'écart "
+                       "avec la réalité reste faible — une autre façon d'arriver au même seuil que la règle simple.", None))
+        if "ExposAmt2" not in d.columns or "ExposCnt" not in d.columns:
+            lignes.append(("ℹ", "Les colonnes nécessaires pour affiner ce calcul au montant sont absentes : "
+                           "cette vérification est ignorée.", None))
+            return
+        a = d2.groupby(cols).agg(E=("ExposCnt", "sum"), A=("ExposAmt", "sum"), A2=("ExposAmt2", "sum")).reset_index()
+        m = tab[cols].merge(a, on=cols, how="left")
+        cv2 = np.clip(np.where(m["A"] > 0, m["A2"] * m["E"] / m["A"] ** 2, 1.0), 1.0, None)
+        seuil = n_plein * cv2
+        z_ajuste = np.minimum(1.0, np.sqrt(tab["Deces"].to_numpy(float) / seuil))
+        moins = (tab["Z"].to_numpy(float) - z_ajuste) > 0.10
+        w = tab["Poids"].to_numpy(float)
+        part = float(w[moins].sum())
+        lignes.append(("⚠" if moins.any() else "✓",
+                       f"{int(moins.sum())} strate(s), représentant {part:.0%} du montant attendu, ont des capitaux "
+                       "très inégaux (quelques grosses polices dominent) : leur crédibilité est peut-être surestimée "
+                       "si on ne compte que le nombre de décès.", niveau_pct(1 - part) if moins.any() else "haut"))
+
+    def whitney(lignes):
+        K = n_plein / 4
+        lignes.append(("✓", f"Cette formule donne presque le même résultat que la règle simple : à mi-chemin du "
+                       f"seuil ({_fmt(K)} décès), la confiance atteint déjà 50 %.", None))
+        z_w = tab["Deces"] / (tab["Deces"] + K)
+        ecart = float(np.average(np.abs(tab["Z"] - z_w), weights=tab["Poids"]))
+        lignes.append(("ℹ", f"L'écart moyen entre les deux méthodes, pondéré par le poids de chaque strate, "
+                       f"est de {ecart:.1%} : les deux règles donnent des résultats proches.", niveau_pct(1 - ecart)))
+
+    def buhlmann(lignes):
+        x = d2[d2["ExpecAmt"] > 0]
+        g = x.groupby(cols, sort=False).ngroup().to_numpy()
+        r, n = int(g.max()) + 1, len(x)
+        if r < 2 or n <= r:
+            lignes.append(("⚠", "Pas assez de strates différentes pour appliquer cette méthode ici.", None))
+            return
+        m = x["ExpecAmt"].to_numpy(float)
+        X = (x["DthAmt"] / x["ExpecAmt"]).to_numpy(float)
+        mj = np.bincount(g, weights=m)
+        Xj = np.bincount(g, weights=m * X) / mj
+        mtot = mj.sum()
+        Xbar = float((mj * Xj).sum() / mtot)
+        v = float(np.bincount(g, weights=m * (X - Xj[g]) ** 2).sum() / (n - r))
+        a = float(((mj * (Xj - Xbar) ** 2).sum() - (r - 1) * v) / (mtot - (mj ** 2).sum() / mtot))
+        if not (a > 0 and np.isfinite(a) and np.isfinite(v)):
+            lignes.append(("⚠", "Les strates ne se distinguent pas assez les unes des autres pour que cette méthode "
+                           "apporte quelque chose de plus ici.", None))
+            return
+        k = v / a
+        z_bs = mj / (mj + k)
+        moy = float(np.average(z_bs, weights=mj / mtot))
+        lignes.append(("✓", "Cette méthode, plus savante, calcule elle-même le seuil de confiance à partir de tes "
+                       "données, au lieu d'utiliser un seuil fixe comme les 3 006 décès de la règle simple.", None))
+        lignes.append(("ℹ", f"Avec cette méthode, la confiance moyenne (pondérée) dans tes strates est de {moy:.0%} "
+                       f"(contre {np.average(tab['Z'], weights=tab['Poids']):.0%} avec la règle simple).", niveau_pct(moy)))
+
+    def bayes(lignes):
+        if "ExpecCnt" not in d.columns:
+            lignes.append(("ℹ", "La colonne du nombre de décès attendus est absente : cette vérification est ignorée.", None))
+            return
+        a = d2.groupby(cols).agg(E=("ExpecCnt", "sum")).reset_index()
+        m = tab[cols].merge(a, on=cols, how="left")
+        E = m["E"].to_numpy(float)
+        D = tab["Deces"].to_numpy(float)
+        ok = np.isfinite(E) & (E > 0)
+        E, D, w = E[ok], D[ok], tab["Poids"].to_numpy(float)[ok]
+        if len(E) < 2:
+            lignes.append(("⚠", "Pas assez de strates différentes pour appliquer cette méthode ici.", None))
+            return
+        mu = D.sum() / E.sum()
+        R = D / E
+        tau2 = ((E * (R - mu) ** 2).sum() - mu * (len(E) - 1)) / (E.sum() - (E ** 2).sum() / E.sum())
+        if not (tau2 > 0 and np.isfinite(tau2)):
+            lignes.append(("⚠", "Les strates ne se distinguent pas assez les unes des autres pour que cette méthode "
+                           "apporte quelque chose de plus ici.", None))
+            return
+        beta = mu / tau2
+        Z = E / (E + beta)
+        moy = float(np.average(Z, weights=w))
+        lignes.append(("✓", "Cette méthode part d'une hypothèse de départ raisonnable (le niveau moyen de tout le "
+                       "portefeuille), puis la corrige progressivement à mesure que les données d'une strate "
+                       "s'accumulent.", None))
+        lignes.append(("ℹ", f"Confiance moyenne (pondérée) obtenue avec cette méthode : {moy:.0%}.", niveau_pct(moy)))
+
+    bloc("Fluctuation limitée, racine carrée", racine)
+    bloc("Fluctuation limitée, intervalle de confiance", intervalle)
+    bloc("Formule de Whitney N/(N+K)", whitney)
+    bloc("Bühlmann / Bühlmann-Straub", buhlmann)
+    bloc("Bayésienne (Poisson-Gamma)", bayes)
+    return blocs
 
 
-def selectionner_colonnes(d, mode, seuil_gain, n_splits=3, callback=None):
-    """Forward selection SUR LES COLONNES SECONDAIRES SEULEMENT (le socle est ajouté systématiquement
-    au moment de l'entraînement, jamais testé ici). d doit déjà inclure les colonnes de cohorte (preparer())."""
-    candidats = [c for c in CANDIDATS_SECONDAIRES if c in d.columns]
-    plis_ = plis(d, mode, n_splits)
-    y, E = d["DthAmt"].to_numpy(float), d["ExpecAmt"].to_numpy(float)
-    base_cols = list(SOCLE)
-    base_dev = pdev(y, E * _glm_ratio_oof(d, base_cols, plis_))     # référence = socle seul
-
-    retenues, restantes, historique = [], list(candidats), []
-    dev_actuelle = base_dev
-    while restantes:
-        gains = {}
-        for c in restantes:
-            o = _glm_ratio_oof(d, base_cols + retenues + [c], plis_)
-            gains[c] = pdev(y, E * o)
-        meilleure = min(gains, key=gains.get)
-        gain_relatif = 1 - gains[meilleure] / dev_actuelle
-        etape = dict(colonne=meilleure, deviance=gains[meilleure], gain=gain_relatif, retenue=gain_relatif >= seuil_gain)
-        historique.append(etape)
-        if callback:
-            callback(etape)
-        if gain_relatif < seuil_gain:
-            break
-        retenues.append(meilleure)
-        restantes.remove(meilleure)
-        dev_actuelle = gains[meilleure]
-    return retenues, historique, base_dev
+def residus_par_strate(d, y, p, strate, decoupage=None):
+    """Écart réel - prédit, agrégé par strate (mêmes tranches que table_strates)."""
+    d2, correspondance = appliquer_decoupage(d, decoupage)
+    cols = [correspondance.get(c, c) for c in strate] or ["_tout"]
+    d2 = d2.assign(_tout=0) if not strate else d2
+    t = d2[cols].copy()
+    t["_reel"], t["_predit"] = np.asarray(y, float), np.asarray(p, float)
+    g = t.groupby(cols).agg(Lignes=("_reel", "size"), Reel=("_reel", "sum"), Predit=("_predit", "sum")).reset_index()
+    g["Ecart"] = g["Reel"] - g["Predit"]
+    g["Ecart_pct"] = np.where(g["Reel"] > 0, g["Ecart"] / g["Reel"], 0.0)
+    return g.sort_values("Lignes", ascending=False).reset_index(drop=True)
 
 
 # ============================================================================================
-# SECTION 5 — Entraînement LightGBM, pli par pli (interruptible)
+# SECTION 4 — Sélection des colonnes secondaires par IMPORTANCE LightGBM
 # ============================================================================================
-PARAMS_LGB = dict(learning_rate=0.05, num_leaves=31, min_data_in_leaf=50, feature_fraction=0.9,
-                  bagging_fraction=0.9, bagging_freq=1, lambda_l2=10.0, verbose=-1)
-
-
 def _mapping(d, cols):
     m = {}
     for c in cols:
@@ -397,84 +432,73 @@ def _point_depart(d, F):
     return d["ExpecAmt"].to_numpy(float) * (np.ones(len(d)) if F is None else np.maximum(F, 1e-3))
 
 
-def etat_initial(d, cols, mode, n_splits, params, avec_facteur, strate, decoupage):
-    return dict(d=d, cols=cols, mode=mode, n_splits=n_splits, params=params, avec_facteur=avec_facteur,
-               strate=strate, decoupage=decoupage, plis=plis(d, mode, n_splits), pli_courant=0,
-               oof=np.full(len(d), np.nan), modeles=[], termine=False, interrompu=False)
-
-
-def entrainer_un_pli(etat, seed=0):
+def _fit_lgb(d, cols, F, params, seed=0):
     import lightgbm as lgb
-    k = etat["pli_courant"]
-    tr, va = etat["plis"][k]
-    d, cols = etat["d"], etat["cols"]
-    d_tr, d_va = d.iloc[tr], d.iloc[va]
-    F_tr = F_va = None
-    if etat["avec_facteur"]:
-        tab_tr = table_strates(d_tr, etat["strate"], etat["decoupage"])
-        F_tr = appliquer_facteur(tab_tr, etat["strate"], d_tr, etat["decoupage"])[1]
-        F_va = appliquer_facteur(tab_tr, etat["strate"], d_va, etat["decoupage"])[1]
-    base_tr, base_va = _point_depart(d_tr, F_tr), _point_depart(d_va, F_va)
-    mapping = _mapping(d_tr, cols)
-    Xtr, Xva = _X(d_tr, cols, mapping), _X(d_va, cols, mapping)
-    ytr, yva = d_tr["DthAmt"].to_numpy(float), d_va["DthAmt"].to_numpy(float)
-    ztr, zva = ytr / np.clip(base_tr, 1e-9, None), yva / np.clip(base_va, 1e-9, None)
-    p = {k: v for k, v in etat["params"].items() if k != "max_rounds"}
-    p = dict(p, objective="poisson", seed=seed)
-    t0 = time.time()
-    dtr_lgb = lgb.Dataset(Xtr, ztr, weight=base_tr)
-    dva_lgb = lgb.Dataset(Xva, zva, weight=base_va, reference=dtr_lgb)
-    b = lgb.train(p, dtr_lgb, etat["params"].get("max_rounds", 2000), valid_sets=[dva_lgb],
-                  callbacks=[lgb.early_stopping(100, verbose=False)])
-    p_va = base_va * np.exp(b.predict(Xva, raw_score=True, num_iteration=b.best_iteration))
-    dt = time.time() - t0
-    etat["oof"][va] = p_va
-    etat["modeles"].append(dict(booster=b.model_to_string(num_iteration=b.best_iteration), mapping=mapping))
-    etat["pli_courant"] += 1
-    if etat["pli_courant"] >= len(etat["plis"]):
-        etat["termine"] = True
-    return dict(pli=k + 1, sur=len(etat["plis"]), temps=dt, deviance_pli=pdev(yva, p_va),
-               deviance_table_pli=pdev(yva, d_va["ExpecAmt"].to_numpy(float)), n_arbres=b.best_iteration)
-
-
-def resume_hors_pli(etat):
-    cov = ~np.isnan(etat["oof"])
-    d = etat["d"]
-    y, e = d["DthAmt"].to_numpy(float)[cov], d["ExpecAmt"].to_numpy(float)[cov]
-    p = etat["oof"][cov]
-    return dict(n=int(cov.sum()), y=y, e=e, p=p, deviance_table=pdev(y, e), deviance_modele=pdev(y, p),
-               rmse_table=rmse(y, e), rmse_modele=rmse(y, p), somme_pred_reel=float(p.sum() / y.sum()))
-
-
-def finaliser(etat, seed=0):
-    import lightgbm as lgb
-    d = etat["d"]
-    F = None
-    if etat["avec_facteur"]:
-        tab_all = table_strates(d, etat["strate"], etat["decoupage"])
-        F = appliquer_facteur(tab_all, etat["strate"], d, etat["decoupage"])[1]
-        etat["tab_facteur_finale"] = tab_all
-    if etat["mode"] == "melange" and any(c in etat["cols"] for c in ("coh_ae_amt", "coh_log_E")):
-        etat["coh_g"], etat["coh_k_amt"] = cohort_table(d)   # table complète (pas hors-pli) pour predire()
     base = _point_depart(d, F)
-    mapping = _mapping(d, etat["cols"])
-    X = _X(d, etat["cols"], mapping)
+    mapping = _mapping(d, cols)
+    X = _X(d, cols, mapping)
     y = d["DthAmt"].to_numpy(float)
     z = y / np.clip(base, 1e-9, None)
-    n_rounds = max(50, etat.get("_n_rounds_moyen", 200))
-    p = {k: v for k, v in etat["params"].items() if k != "max_rounds"}
+    p = {k: v for k, v in params.items() if k != "max_rounds"}
     p = dict(p, objective="poisson", seed=seed)
-    b = lgb.train(p, lgb.Dataset(X, z, weight=base), n_rounds)
-    etat["modele_final"] = dict(booster=b.model_to_string(), mapping=mapping)
-    return etat["modele_final"]
+    b = lgb.train(p, lgb.Dataset(X, z, weight=base), params.get("max_rounds", 300))
+    return b, mapping, base
+
+
+def importance_colonnes(d, params, seed=0):
+    """Entraîne UN LightGBM avec le socle + TOUTES les colonnes secondaires disponibles, et renvoie
+    l'importance de chacune (en % du total), triée. Aucun facteur de crédibilité ici : on veut
+    l'importance « brute » de chaque colonne, indépendamment du choix fait à l'étape Facteur."""
+    candidats = [c for c in CANDIDATS_SECONDAIRES if c in d.columns]
+    cols = list(SOCLE) + candidats
+    b, mapping, _ = _fit_lgb(d, cols, None, params, seed)
+    imp = b.feature_importance(importance_type="gain")
+    total = imp.sum() or 1.0
+    t = pd.DataFrame({"Colonne": cols, "Importance (%)": 100 * imp / total})
+    t["Groupe"] = np.where(t["Colonne"].isin(SOCLE), "Socle", "Secondaire")
+    t["Définition"] = t["Colonne"].map(CANDIDATS_SECONDAIRES).fillna("Variable du socle")
+    return t.sort_values("Importance (%)", ascending=False).reset_index(drop=True)
+
+
+def selectionner_par_importance(d, seuil_pct, params, seed=0):
+    """Colonnes secondaires dont l'importance dépasse seuil_pct (en % du total). Renvoie (colonnes, table)."""
+    t = importance_colonnes(d, params, seed)
+    t_sec = t[t["Groupe"] == "Secondaire"]
+    retenues = t_sec.loc[t_sec["Importance (%)"] >= seuil_pct, "Colonne"].tolist()
+    return retenues, t
 
 
 # ============================================================================================
-# SECTION 6 — Tendance temporelle (appliquée APRÈS la prédiction du modèle, jamais en entrée)
+# SECTION 5 — Entraînement : UN SEUL ajustement, sur toutes les lignes de df (aucune validation croisée)
 # ============================================================================================
-def appliquer_tendance(pred, n_annees, taux):
-    """pred déjà calculée par le modèle ; n_annees = écart entre l'année de la ligne et la dernière
-    année de df ; taux = taux annuel d'amélioration (ex. 0.012 pour 1,2 %)."""
+def entrainer(d, cols, avec_facteur, strate, decoupage, params, seed=0):
+    """
+    Ajuste le modèle final directement sur toutes les lignes de d. Renvoie (modele, resume) où
+    resume contient les prédictions IN-SAMPLE (le modèle a vu ces lignes à l'entraînement : les
+    métriques sont donc optimistes — c'est un choix assumé, pas un oubli, voir la conversation).
+    """
+    F = None
+    tab_facteur = coh_g = coh_k_amt = None
+    if avec_facteur:
+        tab_facteur = table_strates(d, strate, decoupage)
+        F = appliquer_facteur(tab_facteur, strate, d, decoupage)[1]
+    if any(c in cols for c in ("coh_ae_amt", "coh_log_E")):
+        coh_g, coh_k_amt = cohort_table(d)
+    b, mapping, base = _fit_lgb(d, cols, F, params, seed)
+    p = base * np.exp(b.predict(_X(d, cols, mapping), raw_score=True))
+    y = d["DthAmt"].to_numpy(float)
+    e = d["ExpecAmt"].to_numpy(float)
+    modele = dict(booster=b.model_to_string(), mapping=mapping, cols=cols, avec_facteur=avec_facteur,
+                 strate=strate, decoupage=decoupage, tab_facteur=tab_facteur, coh_g=coh_g, coh_k_amt=coh_k_amt)
+    resume = dict(n=len(d), y=y, e=e, p=p, deviance_table=pdev(y, e), deviance_modele=pdev(y, p),
+                 rmse_table=rmse(y, e), rmse_modele=rmse(y, p), somme_pred_reel=float(p.sum() / y.sum()))
+    return modele, resume
+
+
+# ============================================================================================
+# SECTION 6 — Tendance temporelle (taux FIXE, appliquée après la prédiction)
+# ============================================================================================
+def appliquer_tendance(pred, n_annees, taux=TAUX_TENDANCE):
     n_annees = np.asarray(n_annees, float)
     return np.asarray(pred, float) * (1 - taux) ** np.clip(n_annees, 0, None)
 
@@ -485,16 +509,12 @@ def calculer_n_annees(resultats, derniere_annee_df):
 
 
 # ============================================================================================
-# SECTION 7 — Métriques : RMSE, déviance de Poisson, Gini, double lift chart
+# SECTION 7 — Métriques : RMSE, déviance de Poisson, Gini
 # ============================================================================================
 def gini_normalise(y, p, poids=None):
-    """Indice de Gini normalisé (0 = aucune discrimination, 1 = discrimination parfaite).
-    On trie par prédiction croissante, on trace la part cumulée du réel, et on compare à la
-    courbe obtenue en triant directement par le réel (le meilleur Gini possible)."""
     y, p = np.asarray(y, float), np.asarray(p, float)
     w = np.ones(len(y)) if poids is None else np.asarray(poids, float)
-
-    _trapz = getattr(np, "trapezoid", None) or np.trapz   # np.trapz retire en numpy >= 2.0
+    _trapz = getattr(np, "trapezoid", None) or np.trapz
 
     def lorenz_aire(ordre):
         yo, wo = y[ordre], w[ordre]
@@ -502,72 +522,45 @@ def gini_normalise(y, p, poids=None):
         cum_y = np.cumsum(yo * wo) / (yo * wo).sum()
         return float(_trapz(cum_y, cum_w))
 
-    aire_modele = lorenz_aire(np.argsort(p))
-    aire_parfaite = lorenz_aire(np.argsort(y))
-    gini_modele = 1 - 2 * aire_modele
-    gini_parfait = 1 - 2 * aire_parfaite
+    gini_modele = 1 - 2 * lorenz_aire(np.argsort(p))
+    gini_parfait = 1 - 2 * lorenz_aire(np.argsort(y))
     return gini_modele / gini_parfait if gini_parfait > 1e-9 else float("nan")
-
-
-def double_lift(y, p_modele, p_reference, n_quantiles=10):
-    """Trie les lignes par le RAPPORT modèle/référence, regroupe en quantiles de poids égal (pondérés
-    par la référence), et compare la moyenne réelle à la moyenne de chaque prédiction dans chaque
-    quantile. Sert à voir lequel des deux colle le mieux à la réalité selon la tranche de risque."""
-    y, pm, pr = np.asarray(y, float), np.asarray(p_modele, float), np.asarray(p_reference, float)
-    ratio = pm / np.clip(pr, 1e-9, None)
-    ordre = np.argsort(ratio)
-    y, pm, pr = y[ordre], pm[ordre], pr[ordre]
-    poids = np.clip(pr, 1e-9, None)
-    cum = np.cumsum(poids) / poids.sum()
-    q = np.clip((cum * n_quantiles).astype(int), 0, n_quantiles - 1)
-    df = pd.DataFrame({"quantile": q, "y": y, "pm": pm, "pr": pr})
-    g = df.groupby("quantile").agg(Réel=("y", "mean"), Modèle=("pm", "mean"), Référence=("pr", "mean"), Lignes=("y", "size"))
-    g.index = [f"Q{i+1}" for i in g.index]
-    g.index.name = "Quantile"
-    return g.reset_index()
 
 
 # ============================================================================================
 # SECTION 8 — Sauvegarde, chargement, prédiction sur resultats
 # ============================================================================================
-def construire_bundle(etat, taux_tendance=None, derniere_annee_df=None):
-    return dict(cols=etat["cols"], mode=etat["mode"], avec_facteur=etat["avec_facteur"], strate=etat["strate"],
-               decoupage=etat["decoupage"], tab_facteur=etat.get("tab_facteur_finale"), modele=etat["modele_final"],
-               coh_g=etat.get("coh_g"), coh_k_amt=etat.get("coh_k_amt"),
-               resume=resume_hors_pli(etat), taux_tendance=taux_tendance, derniere_annee_df=derniere_annee_df)
+def construire_bundle(modele, resume, derniere_annee_df):
+    return dict(modele=modele, resume=resume, derniere_annee_df=derniere_annee_df)
 
 
 def bundle_to_bytes(bundle):
     b = dict(bundle)
-    b.pop("resume", None)          # contient des tableaux numpy volumineux, inutiles pour re-prédire
+    b["resume"] = {k: v for k, v in b["resume"].items() if k not in ("y", "e", "p")}   # tableaux volumineux, inutiles pour re-prédire
     return pickle.dumps(b)
 
 
-def bundle_from_bytes(b):
-    return pickle.loads(b)
-
-
-def _predict_lgb(modele, d, cols, F):
-    import lightgbm as lgb
-    base = _point_depart(d, F)
-    X = _X(d, cols, modele["mapping"])
-    booster = lgb.Booster(model_str=modele["booster"])
-    return base * np.exp(booster.predict(X, raw_score=True))
+def bundle_from_bytes(raw):
+    return pickle.loads(raw)
 
 
 def predire(bundle, resultats, appliquer_la_tendance=True):
+    m = bundle["modele"]
     res = prep(resultats).reset_index(drop=True)
-    if bundle.get("coh_g") is not None:
-        res = pd.concat([res, cohort_from_table(bundle["coh_g"], bundle["coh_k_amt"], res)], axis=1)
+    if m.get("coh_g") is not None:
+        res = pd.concat([res, cohort_from_table(m["coh_g"], m["coh_k_amt"], res)], axis=1)
     else:
-        res["coh_ae_amt"], res["coh_log_E"] = 1.0, 0.0    # mode 'futur', ou cohorte non utilisée
+        res["coh_ae_amt"], res["coh_log_E"] = 1.0, 0.0
     F = None
-    if bundle["avec_facteur"]:
-        F = appliquer_facteur(bundle["tab_facteur"], bundle["strate"], res, bundle["decoupage"])[1]
-    amt = _predict_lgb(bundle["modele"], res, bundle["cols"], F)
-    if appliquer_la_tendance and bundle.get("taux_tendance") is not None and bundle.get("derniere_annee_df") is not None:
+    if m["avec_facteur"]:
+        F = appliquer_facteur(m["tab_facteur"], m["strate"], res, m["decoupage"])[1]
+    import lightgbm as lgb
+    base = _point_depart(res, F)
+    booster = lgb.Booster(model_str=m["booster"])
+    amt = base * np.exp(booster.predict(_X(res, m["cols"], m["mapping"]), raw_score=True))
+    if appliquer_la_tendance:
         n = calculer_n_annees(resultats, bundle["derniere_annee_df"])
-        amt = appliquer_tendance(amt, n, bundle["taux_tendance"])
+        amt = appliquer_tendance(amt, n)
     sub = resultats.copy()
     sub["DthAmt"] = np.clip(amt, 0, None)
     return sub
@@ -610,6 +603,7 @@ def predire(bundle, resultats, appliquer_la_tendance=True):
 """
 FRONTEND (Streamlit) — ne contient AUCUN calcul : tout est délégué à backend.py.
 Pipeline : Données -> Strates & crédibilité -> Facteur -> Colonnes -> Entraînement -> Résultats.
+AUCUNE validation croisée : un seul entraînement, sur toutes les lignes de df (voir backend.py).
 
 Lancement : streamlit run app.py
 """
@@ -625,9 +619,9 @@ import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import backend as b
-importlib.reload(b)   # Streamlit ne relit pas les fichiers importés tout seul : voir conversation précédente
+importlib.reload(b)
 
-assert hasattr(b, "niveau_pct") and hasattr(b, "gini_normalise"), (
+assert hasattr(b, "criteres_credibilite") and hasattr(b, "importance_colonnes"), (
     f"Le fichier backend.py chargé ({b.__file__}) est une VERSION PÉRIMÉE. "
     "Remplace-le par le dernier backend.py fourni, puis supprime le dossier __pycache__.")
 
@@ -642,10 +636,10 @@ NOM_EQUIPE = "Équipe 7"
 
 ETAPES = [
     ("📂", "Données", "Glisser-déposer et nettoyer"),
-    ("🧩", "Strates & crédibilité", "Tranches, fusion, crédibilité"),
+    ("🧩", "Strates & crédibilité", "Tranches, crédibilité"),
     ("⚖️", "Facteur", "Point de départ ou non"),
-    ("🎯", "Colonnes", "Socle fixe + sélection dynamique"),
-    ("🚀", "Entraînement", "LightGBM, pli par pli"),
+    ("🎯", "Colonnes", "Socle fixe + sélection"),
+    ("🚀", "Entraînement", "LightGBM, un seul ajustement"),
     ("🏆", "Résultats", "Métriques, tendance, téléchargement"),
 ]
 
@@ -655,10 +649,9 @@ ETAPES = [
 # ============================================================================================
 def init_etat():
     defauts = dict(etape=0, df=None, df_nom=None, strate=[], sans_strate=False, strate_confirmee=False,
-                   decoupage={}, tab_strate=None, avec_facteur=None, seuil_gain=0.01, n_splits=5,
-                   rapide=False, learning_rate=0.05, max_rounds=2000, cols_secondaires=None,
-                   historique_selection=None, train=None, train_signature=None, bundle=None,
-                   taux_tendance=0.012, resultats_bytes=None, resultats_nom=None)
+                   decoupage={}, tab_strate=None, avec_facteur=None, methode_cols="importance", seuil_pct=1.0,
+                   cols_secondaires=None, tab_importance=None, learning_rate=0.05, max_rounds=2000,
+                   rapide=False, modele=None, resume=None, bundle=None, train_signature=None)
     for k, v in defauts.items():
         st.session_state.setdefault(k, v)
 
@@ -671,9 +664,8 @@ def aller(delta):
 
 
 def signature_actuelle():
-    s = (tuple(st.session_state.cols_secondaires or []), st.session_state.n_splits, st.session_state.avec_facteur,
-        tuple(st.session_state.strate), str(st.session_state.decoupage), st.session_state.rapide,
-        st.session_state.learning_rate, st.session_state.max_rounds)
+    s = (tuple(st.session_state.cols_secondaires or []), st.session_state.avec_facteur, tuple(st.session_state.strate),
+        str(st.session_state.decoupage), st.session_state.rapide, st.session_state.learning_rate, st.session_state.max_rounds)
     return hashlib.md5(str(s).encode()).hexdigest()
 
 
@@ -683,8 +675,7 @@ def badge(symbole, texte, niveau=None):
     if niveau in ("bas", "moyen", "haut"):
         label = {"bas": "Faible", "moyen": "Moyenne", "haut": "Bonne"}[niveau]
         pastille = f"<span class='niveau-pill niveau-{niveau}'>● Fiabilité {label}</span>"
-    st.markdown(f"<div class='ligne-message'><span class='badge {classe}'>{symbole}</span> {texte} {pastille}</div>",
-               unsafe_allow_html=True)
+    st.markdown(f"<div class='ligne-message'><span class='badge {classe}'>{symbole}</span> {texte} {pastille}</div>", unsafe_allow_html=True)
 
 
 def _couleur_cellule(niveau):
@@ -699,8 +690,7 @@ def colorer_fiabilite(val):
 
 def kicker(icone, titre, description):
     st.markdown(f"""<div class="kicker-page"><div class="icone">{icone}</div>
-        <div class="textes"><p class="titre">{titre}</p><p class="desc">{description}</p></div></div>""",
-               unsafe_allow_html=True)
+        <div class="textes"><p class="titre">{titre}</p><p class="desc">{description}</p></div></div>""", unsafe_allow_html=True)
 
 
 def pied_navigation(peut_avancer=True, texte_suivant="Suivant →"):
@@ -744,8 +734,8 @@ with st.sidebar:
         lignes_resume.append(("Strate", "aucune"))
     if st.session_state.cols_secondaires is not None:
         lignes_resume.append(("Colonnes", str(len(b.SOCLE) + len(st.session_state.cols_secondaires))))
-    if st.session_state.bundle is not None:
-        lignes_resume.append(("Déviance", f"{st.session_state.bundle['resume']['deviance_modele']:,.0f}".replace(",", " ")))
+    if st.session_state.resume is not None:
+        lignes_resume.append(("Déviance", f"{st.session_state.resume['deviance_modele']:,.2f}".replace(",", " ")))
     if lignes_resume:
         html_resume = "".join(f"<div class='ligne'><span>{k}</span><b>{v}</b></div>" for k, v in lignes_resume)
         st.markdown(f"<div class='sb-resume'>{html_resume}</div>", unsafe_allow_html=True)
@@ -797,7 +787,7 @@ if etape == 0:
 
 
 # ============================================================================================
-# ÉTAPE 1 — Strates & crédibilité (tranches personnalisables, confirmation, suggestion de fusion)
+# ÉTAPE 1 — Strates & crédibilité (tranches personnalisables, confirmation, les 5 critères)
 # ============================================================================================
 elif etape == 1:
     df = st.session_state.df
@@ -822,15 +812,8 @@ elif etape == 1:
     if decoupables and not sans:
         st.markdown("**Tranches personnalisées** (facultatif — laisse vide pour garder les valeurs telles quelles)")
         for col in decoupables:
-            c1, c2 = st.columns([3, 1])
-            with c1:
-                sugg = ", ".join(str(x) for x in b.suggestion_bornes(d, col))
-                txt = st.text_input(f"Bornes pour {col} (ex. 0, 20, 40, 60, 80)", value="", placeholder=f"suggestion : {sugg}", key=f"bornes_{col}")
-            with c2:
-                st.caption(" ")
-                if st.button(f"Réinitialiser {col}", key=f"reset_{col}"):
-                    txt = ""
-                    st.session_state[f"bornes_{col}"] = ""
+            sugg = ", ".join(str(x) for x in b.suggestion_bornes(d, col))
+            txt = st.text_input(f"Bornes pour {col} (ex. 0, 20, 40, 60, 80)", value="", placeholder=f"suggestion : {sugg}", key=f"bornes_{col}")
             if txt.strip():
                 try:
                     bornes = sorted(int(x.strip()) for x in txt.split(","))
@@ -843,15 +826,15 @@ elif etape == 1:
                 del st.session_state.decoupage[col]
                 st.session_state.strate_confirmee = False
     if "Size" in choix_libre and not sans:
-        st.markdown("**Regroupement des tranches de capital (`Size`)** (facultatif)")
+        st.markdown("**Regroupement des tranches de capital (`Size`)** — mets le même texte à des tranches pour les fusionner ; laisse vide pour garder le libellé d'origine")
         tailles = sorted(d["Size"].dropna().unique().tolist())
         libelles = {t: b.LIBELLES.get("Size", {}).get(t, str(t)) for t in tailles}
-        groupe_actuel = st.session_state.decoupage.get("Size", {t: libelles[t] for t in tailles})
+        groupe_actuel = st.session_state.decoupage.get("Size", {})
         cols_g = st.columns(len(tailles))
         nouveau_groupe = {}
         for i, t in enumerate(tailles):
             with cols_g[i]:
-                nouveau_groupe[t] = st.text_input(libelles[t], value=str(groupe_actuel.get(t, libelles[t])), key=f"size_grp_{t}", label_visibility="visible")
+                nouveau_groupe[t] = st.text_input(libelles[t], value=str(groupe_actuel.get(t, "")), key=f"size_grp_{t}")
         if nouveau_groupe != groupe_actuel:
             st.session_state.decoupage["Size"] = nouveau_groupe
             st.session_state.strate_confirmee = False
@@ -885,25 +868,24 @@ elif etape == 1:
         st.write("")
         st.caption("🟢 Vert = strate fiable. 🟡 Jaune = fiabilité moyenne. 🔴 Rouge = peu de décès observés.")
         cols_reel = tab.attrs.get("cols_reel", strate)
-        cols_aff = cols_reel + ["Lignes", "Deces", "Attendu", "Reel", "Ratio", "Z", "Fiabilite", "Facteur", "Poids"]
-        cols_aff = [c for c in cols_aff if c in tab.columns]
-        style = tab[cols_aff].style.format({"Attendu": "{:,.0f}", "Reel": "{:,.0f}", "Ratio": "{:.3f}", "Z": "{:.0%}",
-                                            "Facteur": "{:.3f}", "Poids": "{:.1%}", "Deces": "{:,.0f}"})
+        cols_aff = [c for c in cols_reel + ["Lignes", "Deces", "Attendu", "Reel", "Ratio", "Z", "Fiabilite", "Facteur", "Poids"] if c in tab.columns]
+        style = tab[cols_aff].style.format({"Attendu": "{:,.2f}", "Reel": "{:,.2f}", "Ratio": "{:.2f}", "Z": "{:.0%}",
+                                            "Facteur": "{:.2f}", "Poids": "{:.1%}", "Deces": "{:,.2f}"})
         if "Z" in cols_aff:
             style = style.map(colorer_fiabilite, subset=["Z"])
         st.dataframe(style, use_container_width=True, height=300)
         st.markdown("</div>", unsafe_allow_html=True)
 
-        fusion = b.suggestion_fusion(tab)
-        if len(fusion):
-            st.markdown("<div class='carte'><h3>🔗 Suggestion de fusion entre strates voisines</h3>", unsafe_allow_html=True)
-            st.caption("Paires de strates voisines dont l'écart de ratio est petit par rapport au bruit statistique attendu — "
-                      "des candidates à regrouper, à toi de juger si la logique métier le justifie.")
-            n_reco = int((fusion["Recommandation"] == "Fusionner").sum())
-            st.caption(f"{n_reco} paire(s) sur {len(fusion)} recommandée(s) pour fusion.")
-            st.dataframe(fusion.style.format({c: "{:.3f}" for c in fusion.columns if fusion[c].dtype == float}),
-                        use_container_width=True, height=min(300, 40 + 35 * len(fusion)))
-            st.markdown("</div>", unsafe_allow_html=True)
+        st.markdown("<div class='carte'><h3>🔎 Autres critères de crédibilité (à titre informatif)</h3>", unsafe_allow_html=True)
+        st.caption("Ce sont d'autres façons de calculer la même idée : à quel point peut-on se fier aux données "
+                  "observées plutôt qu'à la table de référence. Elles n'influencent pas le facteur ci-dessus.")
+        blocs = b.criteres_credibilite(d, strate, tab, st.session_state.decoupage)
+        onglets = st.tabs([bl["titre"] for bl in blocs])
+        for onglet, bl in zip(onglets, blocs):
+            with onglet:
+                for s, t, n in bl["lignes"]:
+                    badge(s, t, n)
+        st.markdown("</div>", unsafe_allow_html=True)
 
     c1, c2 = st.columns(2)
     with c1:
@@ -937,167 +919,138 @@ elif etape == 2:
 
 
 # ============================================================================================
-# ÉTAPE 3 — Colonnes : socle fixe + sélection dynamique (colonnes secondaires seulement)
+# ÉTAPE 3 — Colonnes : socle fixe + sélection (manuelle ou par importance LightGBM)
 # ============================================================================================
 elif etape == 3:
-    kicker("🎯", "Colonnes du modèle", "Un socle toujours inclus, une sélection automatique pour le reste")
+    kicker("🎯", "Colonnes du modèle", "Un socle toujours inclus, une sélection manuelle ou automatique pour le reste")
     st.markdown("<div class='carte'><h3>Socle (toujours inclus)</h3>", unsafe_allow_html=True)
     st.write("Ces variables sont des facteurs de risque reconnus : elles entrent toujours dans le modèle, "
-            "sans passer par un calcul de gain statistique.")
+            "sans passer par une sélection.")
     st.markdown("".join(f"<span class='tag-col'>{c}</span>" for c in b.SOCLE), unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
-    st.markdown("<div class='carte'><h3>Colonnes secondaires — sélection dynamique</h3>", unsafe_allow_html=True)
-    st.caption("💡 En clair : on essaie les colonnes une par une et on ne garde que celles qui améliorent "
-              "vraiment les prédictions, par rapport au socle seul.")
-    st.session_state.rapide = st.checkbox("Mode rapide (moins de plis, moins d'arbres — pour tester que tout fonctionne avant l'exécution complète)",
-                                          value=st.session_state.rapide)
-    st.session_state.n_splits = st.number_input("Nombre de plis (validation croisée)", 2, 10, st.session_state.n_splits, disabled=st.session_state.rapide)
-    st.session_state.seuil_gain = st.number_input("Seuil de gain relatif (une colonne est gardée si elle réduit la déviance d'au moins ce %)",
-                                                  min_value=0.0001, max_value=0.05, value=st.session_state.seuil_gain, step=0.0005, format="%.4f")
-    if st.button("Lancer la sélection dynamique", type="primary"):
-        mode = b.detecter_mode(st.session_state.df, st.session_state.df)   # mode réel connu seulement avec resultats ; par défaut mélange ici
-        mode = "melange"
-        d = b.preparer(st.session_state.df, mode)
-        zone = st.empty()
-        historique = []
+    st.markdown("<div class='carte'><h3>Colonnes secondaires disponibles</h3>", unsafe_allow_html=True)
+    tab_def = pd.DataFrame({"Colonne": list(b.CANDIDATS_SECONDAIRES), "Définition": list(b.CANDIDATS_SECONDAIRES.values())})
+    st.dataframe(tab_def, use_container_width=True, hide_index=True)
+    st.markdown("</div>", unsafe_allow_html=True)
 
-        def callback(etape_dict):
-            historique.append(etape_dict)
-            with zone.container():
-                for e in historique:
-                    s = "✓" if e["retenue"] else "⚠"
-                    badge(s, f"{e['colonne']} : gain {e['gain']:.2%} (déviance {e['deviance']:,.0f})".replace(",", " "))
+    st.markdown("<div class='carte'><h3>Méthode de sélection</h3>", unsafe_allow_html=True)
+    methode = st.radio("Méthode", ["Sélection automatique (importance du modèle)", "Sélection manuelle"],
+                       index=0 if st.session_state.methode_cols == "importance" else 1)
+    st.session_state.methode_cols = "importance" if methode.startswith("Sélection automatique") else "manuelle"
+    st.session_state.rapide = st.checkbox("Mode rapide (moins d'arbres — pour tester que tout fonctionne avant l'exécution complète)", value=st.session_state.rapide)
 
-        with st.spinner("Sélection en cours..."):
-            cols_sec, hist, base_dev = b.selectionner_colonnes(d, mode, st.session_state.seuil_gain,
-                                                                n_splits=2 if st.session_state.rapide else int(st.session_state.n_splits), callback=callback)
+    if st.session_state.methode_cols == "manuelle":
+        defaut = [c for c in (st.session_state.cols_secondaires or []) if c in b.CANDIDATS_SECONDAIRES]
+        cols_sec = st.multiselect("Colonnes secondaires à inclure", list(b.CANDIDATS_SECONDAIRES), default=defaut)
         st.session_state.cols_secondaires = cols_sec
-        st.session_state.historique_selection = hist
+    else:
+        st.caption("💡 En clair : on entraîne le modèle une fois avec toutes les colonnes secondaires, on regarde "
+                  "combien chacune compte pour lui, et on ne garde que celles au-dessus du seuil.")
+        st.session_state.seuil_pct = st.number_input("Seuil d'importance (% du total)", min_value=0.1, max_value=20.0,
+                                                      value=st.session_state.seuil_pct, step=0.5)
+        if st.button("Calculer l'importance et sélectionner", type="primary"):
+            mode = "melange"
+            d = b.preparer(st.session_state.df, mode)
+            params = dict(learning_rate=st.session_state.learning_rate, max_rounds=100 if st.session_state.rapide else st.session_state.max_rounds)
+            with st.spinner("Calcul en cours..."):
+                cols_sec, tab_imp = b.selectionner_par_importance(d, st.session_state.seuil_pct, params)
+            st.session_state.cols_secondaires = cols_sec
+            st.session_state.tab_importance = tab_imp
+        if st.session_state.tab_importance is not None:
+            t = st.session_state.tab_importance.copy()
+            t["Retenue"] = np.where(t["Groupe"] == "Socle", "—", np.where(t["Colonne"].isin(st.session_state.cols_secondaires or []), "✓", ""))
+            st.dataframe(t.style.format({"Importance (%)": "{:.2f}"}), use_container_width=True, hide_index=True)
+
     if st.session_state.cols_secondaires is not None:
         st.success(f"Colonnes secondaires retenues : {st.session_state.cols_secondaires or '(aucune)'}")
-        st.markdown("**Colonnes finales du modèle :**")
-        st.markdown("".join(f"<span class='tag-col'>{c}</span>" for c in b.SOCLE + st.session_state.cols_secondaires), unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
     pied_navigation(st.session_state.cols_secondaires is not None)
 
 
 # ============================================================================================
-# ÉTAPE 4 — Entraînement LightGBM, pli par pli
+# ÉTAPE 4 — Entraînement : un seul ajustement (aucune validation croisée)
 # ============================================================================================
 elif etape == 4:
-    kicker("🚀", "Entraînement", "Un pli à la fois pour pouvoir t'arrêter, ou tous d'un coup")
+    kicker("🚀", "Entraînement", "Un seul ajustement du modèle, sur toutes les données")
     st.markdown("<div class='carte'>", unsafe_allow_html=True)
-    mode = "melange"   # affiné une fois resultats chargé, à l'étape Résultats
-    d = b.preparer(st.session_state.df, mode)
+    d = b.preparer(st.session_state.df, "melange")
     cols_final = list(b.SOCLE) + list(st.session_state.cols_secondaires or [])
 
     sig = signature_actuelle()
-    if st.session_state.train is None or st.session_state.train_signature != sig:
-        params = dict(learning_rate=st.session_state.learning_rate, max_rounds=200 if st.session_state.rapide else st.session_state.max_rounds)
-        st.session_state.train = b.etat_initial(d, cols_final, mode, 2 if st.session_state.rapide else st.session_state.n_splits,
-                                                params, st.session_state.avec_facteur, st.session_state.strate, st.session_state.decoupage)
-        st.session_state.train_signature = sig
+    if st.session_state.modele is None or st.session_state.train_signature != sig:
+        st.session_state.modele = None
+        st.session_state.resume = None
         st.session_state.bundle = None
-        st.info("Réglages pris en compte : entraînement (ré)initialisé.")
+        st.session_state.train_signature = sig
+        st.info("Réglages pris en compte : clique sur « Entraîner » pour lancer l'ajustement.")
 
-    etat = st.session_state.train
-    fait, total = etat["pli_courant"], len(etat["plis"])
-    st.progress(fait / total if total else 0, text=f"Pli {fait} / {total}")
-
-    c1, c2, c3 = st.columns(3)
-    if c1.button("▶ Entraîner un pli", disabled=etat["termine"], use_container_width=True):
-        with st.spinner("Entraînement du pli en cours..."):
-            r = b.entrainer_un_pli(etat)
-        st.toast(f"Pli {r['pli']}/{r['sur']} terminé en {r['temps']:.1f}s — déviance {r['deviance_pli']:,.0f}".replace(",", " "))
-        st.rerun()
-    if c2.button("⏭ Entraîner tous les plis restants", disabled=etat["termine"], use_container_width=True,
-                help="Non interruptible une fois lancé — préfère 'un pli' si tu veux pouvoir t'arrêter en cours de route."):
-        barre = st.progress(0.0)
-        while not etat["termine"]:
-            b.entrainer_un_pli(etat)
-            barre.progress(etat["pli_courant"] / total)
-        st.rerun()
-    if c3.button("⏹ Interrompre / arrêter ici", disabled=fait == 0, use_container_width=True):
-        etat["termine"] = True
-        etat["interrompu"] = fait < total
-        st.rerun()
-
-    if fait > 0:
-        lignes = []
-        for i, (tr, va) in enumerate(etat["plis"][:fait]):
-            y_va = d.iloc[va]["DthAmt"].to_numpy(float)
-            p_va = etat["oof"][va]
-            e_va = d.iloc[va]["ExpecAmt"].to_numpy(float)
-            lignes.append(dict(Pli=i + 1, Déviance_table=b.pdev(y_va, e_va), Déviance_modèle=b.pdev(y_va, p_va)))
-        histo = pd.DataFrame(lignes)
-        st.markdown("**Déviance de Poisson par pli**")
-        st.line_chart(histo.set_index("Pli")[["Déviance_table", "Déviance_modèle"]])
-        resume = b.resume_hors_pli(etat)
-        m1, m2, m3 = st.columns(3)
-        m1.markdown(f"<div class='metrique-box'><div class='val'>{resume['deviance_modele']:,.0f}</div><div class='lab'>déviance (hors-pli)</div></div>".replace(",", " "), unsafe_allow_html=True)
-        gain = 1 - resume['deviance_modele'] / resume['deviance_table']
-        m2.markdown(f"<div class='metrique-box'><div class='val'>{gain:.1%}</div><div class='lab'>gain vs table</div></div>", unsafe_allow_html=True)
-        m3.markdown(f"<div class='metrique-box'><div class='val'>{resume['somme_pred_reel']:.3f}</div><div class='lab'>somme prédite / réelle</div></div>", unsafe_allow_html=True)
-
-    if etat["termine"] and st.session_state.bundle is None:
-        if etat.get("interrompu"):
-            st.warning(f"Entraînement arrêté après {fait}/{total} plis : l'estimation hors-pli est moins fiable.")
-        if st.button("✅ Finaliser le modèle (entraîne sur toutes les données)", type="primary"):
-            with st.spinner("Entraînement final..."):
-                b.finaliser(etat)
-                st.session_state.bundle = b.construire_bundle(etat)
+    if st.session_state.modele is None:
+        if st.button("▶ Entraîner le modèle", type="primary", use_container_width=True):
+            params = dict(learning_rate=st.session_state.learning_rate, max_rounds=100 if st.session_state.rapide else st.session_state.max_rounds)
+            with st.spinner("Entraînement en cours..."):
+                t0 = time.time()
+                modele, resume = b.entrainer(d, cols_final, st.session_state.avec_facteur, st.session_state.strate,
+                                             st.session_state.decoupage, params)
+                dt = time.time() - t0
+            st.session_state.modele, st.session_state.resume = modele, resume
+            derniere = int(d["YearStart"].max())
+            st.session_state.bundle = b.construire_bundle(modele, resume, derniere)
+            st.success(f"Entraînement terminé en {dt:.1f}s.")
+            st.rerun()
+    else:
+        st.success("Modèle entraîné.")
+        if st.button("🔁 Réentraîner", use_container_width=True):
+            st.session_state.modele = None
             st.rerun()
     st.markdown("</div>", unsafe_allow_html=True)
     pied_navigation(st.session_state.bundle is not None, texte_suivant="Voir les résultats →")
 
 
 # ============================================================================================
-# ÉTAPE 5 — Résultats : métriques, tendance temporelle, téléchargement, prédiction
+# ÉTAPE 5 — Résultats : métriques, résidus par strate, tendance, téléchargement, prédiction
 # ============================================================================================
 elif etape == 5:
     bundle = st.session_state.bundle
-    kicker("🏆", "Résultats", "Métriques, tendance temporelle et téléchargement")
+    kicker("🏆", "Résultats", "Métriques, résidus par strate et téléchargement")
     st.markdown("<div class='carte'>", unsafe_allow_html=True)
     if bundle is None:
-        st.warning("Aucun modèle finalisé. Reviens à l'étape Entraînement.")
+        st.warning("Aucun modèle entraîné. Reviens à l'étape Entraînement.")
     else:
-        r = bundle["resume"]
+        r = st.session_state.resume
         st.caption("💡 En clair : le RMSE et la déviance mesurent l'écart entre prédictions et réalité (plus petit "
-                  "= mieux). Le Gini mesure la capacité à bien classer les risques du plus faible au plus élevé "
-                  "(proche de 1 = très bon classement).")
-        m1, m2, m3, m4 = st.columns(4)
-        m1.markdown(f"<div class='metrique-box'><div class='val'>{r['rmse_modele']:,.0f}</div><div class='lab'>RMSE</div></div>".replace(",", " "), unsafe_allow_html=True)
-        m2.markdown(f"<div class='metrique-box'><div class='val'>{r['deviance_modele']:,.0f}</div><div class='lab'>déviance Poisson</div></div>".replace(",", " "), unsafe_allow_html=True)
+                  "= mieux). Le Gini mesure la capacité à bien classer les risques du plus faible au plus élevé.")
+        st.caption("⚠ Ces métriques sont calculées sur les données que le modèle a lui-même apprises "
+                  "(aucune validation croisée) : elles sont donc optimistes.")
+        m1, m2, m3 = st.columns(3)
+        m1.markdown(f"<div class='metrique-box'><div class='val'>{r['rmse_modele']:,.2f}</div><div class='lab'>RMSE</div></div>".replace(",", " "), unsafe_allow_html=True)
+        m2.markdown(f"<div class='metrique-box'><div class='val'>{r['deviance_modele']:,.2f}</div><div class='lab'>déviance Poisson</div></div>".replace(",", " "), unsafe_allow_html=True)
         gini_m = b.gini_normalise(r["y"], r["p"])
-        gini_t = b.gini_normalise(r["y"], r["e"])
-        m3.markdown(f"<div class='metrique-box'><div class='val'>{gini_m:.3f}</div><div class='lab'>Gini (table : {gini_t:.3f})</div></div>", unsafe_allow_html=True)
-        m4.markdown(f"<div class='metrique-box'><div class='val'>{1 - r['deviance_modele'] / r['deviance_table']:.1%}</div><div class='lab'>gain vs table</div></div>", unsafe_allow_html=True)
+        m3.markdown(f"<div class='metrique-box'><div class='val'>{gini_m:.2f}</div><div class='lab'>Gini</div></div>", unsafe_allow_html=True)
 
-        st.markdown("**Double lift chart** — modèle contre table de référence, par tranche de risque")
-        dl = b.double_lift(r["y"], r["p"], r["e"])
-        st.line_chart(dl.set_index("Quantile")[["Réel", "Modèle", "Référence"]])
-        st.dataframe(dl.style.format({"Réel": "{:,.0f}", "Modèle": "{:,.0f}", "Référence": "{:,.0f}"}), use_container_width=True)
+        st.markdown("**Résidus par strate** (écart entre le montant réel et le montant prédit)")
+        if st.session_state.strate and not st.session_state.sans_strate:
+            d = b.preparer(st.session_state.df, "melange")
+            res_strate = b.residus_par_strate(d, r["y"], r["p"], st.session_state.strate, st.session_state.decoupage)
+            st.dataframe(res_strate.style.format({"Reel": "{:,.2f}", "Predit": "{:,.2f}", "Ecart": "{:,.2f}", "Ecart_pct": "{:.2%}"}),
+                        use_container_width=True, height=300)
+        else:
+            st.caption("Aucune strate choisie à l'étape 2 : pas de tableau de résidus par strate.")
 
-        st.write(f"**Colonnes du modèle :** {bundle['cols']}")
-        st.write(f"**Facteur comme point de départ :** {'oui — strate ' + str(bundle['strate']) if bundle['avec_facteur'] else 'non'}")
+        st.write(f"**Colonnes du modèle :** {bundle['modele']['cols']}")
+        st.write(f"**Facteur comme point de départ :** {'oui — strate ' + str(bundle['modele']['strate']) if bundle['modele']['avec_facteur'] else 'non'}")
     st.markdown("</div>", unsafe_allow_html=True)
 
     if bundle is not None:
         st.markdown("<div class='carte'><h3>📅 Tendance temporelle</h3>", unsafe_allow_html=True)
         st.caption(b.TAUX_TENDANCE_SOURCE)
-        st.session_state.taux_tendance = st.slider("Taux d'amélioration annuel appliqué APRÈS la prédiction (uniquement "
-                                                    "sur les années futures à df)", 0.0, 0.02, st.session_state.taux_tendance,
-                                                   step=0.001, format="%.3f")
-        derniere = int(pd.to_numeric(st.session_state.df["Year"]).astype(int).max() // 100 + 2000)
         exemples = pd.DataFrame({"Écart (années)": [1, 3, 5, 10]})
-        exemples["Facteur appliqué"] = [(1 - st.session_state.taux_tendance) ** n for n in exemples["Écart (années)"]]
+        exemples["Facteur appliqué"] = [(1 - b.TAUX_TENDANCE) ** n for n in exemples["Écart (années)"]]
         st.dataframe(exemples.style.format({"Facteur appliqué": "{:.4f}"}), use_container_width=True, hide_index=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
         st.markdown("<div class='carte'><h3>💾 Modèle et prédiction</h3>", unsafe_allow_html=True)
-        bundle_final = dict(bundle, taux_tendance=st.session_state.taux_tendance, derniere_annee_df=derniere)
-        st.download_button("💾 Télécharger le modèle entraîné (.pkl)", data=b.bundle_to_bytes(bundle_final),
+        st.download_button("💾 Télécharger le modèle entraîné (.pkl)", data=b.bundle_to_bytes(bundle),
                            file_name="modele_montant.pkl", mime="application/octet-stream", use_container_width=True)
         st.markdown("<hr class='separateur'>", unsafe_allow_html=True)
         st.markdown("**Prédire sur un fichier `resultats` (mêmes colonnes que df, sans DthAmt)**")
@@ -1111,7 +1064,7 @@ elif etape == 5:
                 else:
                     mode_reel = b.detecter_mode(st.session_state.df, res)
                     st.caption(f"Mode détecté : {mode_reel}" + (" — la tendance temporelle s'appliquera." if mode_reel == "futur" else " — la tendance ne s'applique pas (années déjà connues)."))
-                    sub = b.predire(bundle_final, res)
+                    sub = b.predire(bundle, res)
                     st.dataframe(sub.head(30), use_container_width=True)
                     st.download_button("💾 Télécharger la soumission (CSV)", data=sub.to_csv(index=False).encode("utf-8"),
                                        file_name="soumission_montant.csv", mime="text/csv", use_container_width=True)
