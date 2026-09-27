@@ -606,28 +606,6 @@ def predire(bundle, resultats, appliquer_la_tendance=True):
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 # -*- coding: utf-8 -*-
 """
 FRONTEND (Streamlit) — ne contient AUCUN calcul : tout est délégué à backend.py.
@@ -972,7 +950,9 @@ elif etape == 3:
     st.markdown("<div class='carte'><h3>Colonnes secondaires — sélection dynamique</h3>", unsafe_allow_html=True)
     st.caption("💡 En clair : on essaie les colonnes une par une et on ne garde que celles qui améliorent "
               "vraiment les prédictions, par rapport au socle seul.")
-    st.session_state.n_splits = st.number_input("Nombre de plis (validation croisée)", 2, 10, st.session_state.n_splits)
+    st.session_state.rapide = st.checkbox("Mode rapide (moins de plis, moins d'arbres — pour tester que tout fonctionne avant l'exécution complète)",
+                                          value=st.session_state.rapide)
+    st.session_state.n_splits = st.number_input("Nombre de plis (validation croisée)", 2, 10, st.session_state.n_splits, disabled=st.session_state.rapide)
     st.session_state.seuil_gain = st.number_input("Seuil de gain relatif (une colonne est gardée si elle réduit la déviance d'au moins ce %)",
                                                   min_value=0.0001, max_value=0.05, value=st.session_state.seuil_gain, step=0.0005, format="%.4f")
     if st.button("Lancer la sélection dynamique", type="primary"):
@@ -1149,6 +1129,26 @@ elif etape == 5:
             for k in list(st.session_state.keys()):
                 del st.session_state[k]
             st.rerun()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
