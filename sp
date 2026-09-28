@@ -1,10 +1,10 @@
-Accroche (30 s)
+Diapo 1 Accroche (30 s)
 
 « Chaque année, une compagnie d'assurance doit mettre de l'argent de côté pour des décès qui ne sont pas encore arrivés. Elle ne sait ni quand, ni pour qui. Mais elle doit savoir combien.
 
 Trop peu : elle ne pourra pas tenir ses promesses aux familles. Trop : elle immobilise de l'argent qui aurait pu faire baisser les primes.
 
-Problématique (45 s)
+Diapo 2 Problématique (45 s)
 Notre objectif : prévoir les montants de prestations de décès. Nous ne partons pas de zéro. La table de mortalité est notre point de départ, pas notre adversaire. Elle est solide, mais elle décrit une moyenne, pas nos assurés.
 
 La question devient : comment s'appuyer sur la table sans s'y enfermer, et sur nos propres données sans se laisser tromper par le hasard ?
