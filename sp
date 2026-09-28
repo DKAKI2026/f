@@ -43,5 +43,5 @@ coh_log_E	La quantité d'information qui se trouve derrière la mémoire du grou
 Diapo 7 · Le tri (30 s, ex-8, simplifiée)
 
 « Plus de variables, ce n'est pas mieux : certaines n'apportent rien et brouillent la prévision. Nous demandons donc au modèle lui-même : qu'est-ce qui t'a vraiment servi ? Ce qui a peu servi est écarté. Les fondamentaux, sexe, tabac, âge, durée et capital, restent toujours. »
-Diapo 9 · L'évolutivité (50 s)
+Diapo 8 · L'évolutivité (50 s)
 Reste l'avenir. Nous ne demandons pas au modèle de le deviner : il apprend la situation d'aujourd'hui. Pour les années à venir, nous ajoutons une hypothèse séparée, simple et visible : la mortalité continue de s'améliorer lentement, au rythme publié par l'Institut canadien des actuaires. Le chiffre est à l'écran.
